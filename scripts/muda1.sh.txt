@@ -1,0 +1,142 @@
+#!/bin/sh
+# ==============================================================================
+# Script: switch-desktop.sh
+# Descrição: Alternância segura entre LXQt e XFCE com verificação de ambiente,
+#            gestão de Display Manager e pacotes dinâmicos para Bash/Ksh.
+# Compatibilidade: Bash / Ksh (POSIX compliant)
+# ==============================================================================
+
+# Assegurar execução como root
+if [ "$(id -u)" -ne 0 ]; then
+    echo "[ERRO] Este script precisa ser executado como root (sudo)." >&2
+    exit 1
+fi
+
+# 1. Inspeção do Ambiente e Gerenciador de Pacotes
+detect_environment() {
+    if command -v apt-get >/dev/null 2>&1; then
+        PKG_MANAGER="apt"
+        UPDATE_CMD="apt-get update -y"
+        INSTALL_CMD="apt-get install -y --no-install-recommends"
+    elif command -v pacman >/dev/null 2>&1; then
+        PKG_MANAGER="pacman"
+        UPDATE_CMD="pacman -Sy"
+        INSTALL_CMD="pacman -S --noconfirm"
+    else
+        echo "[ERRO] Gerenciador de pacotes não suportado por este script." >&2
+        exit 1
+    fi
+    echo "[INFO] Sistema detectado com gerenciador: $PKG_MANAGER"
+}
+
+# 2. Instalação Segura com Verificação de Nome na Fonte
+install_package_safe() {
+    pkg_name="$1"
+    echo "[VERIFICAÇÃO] Checando disponibilidade do pacote: $pkg_name..."
+    
+    if [ "$PKG_MANAGER" = "apt" ]; then
+        if apt-cache policy "$pkg_name" | grep -q "Candidate:"; then
+            echo "[INSTALAÇÃO] Instalando $pkg_name..."
+            $INSTALL_CMD "$pkg_name"
+        else
+            echo "[AVISO] Pacote $pkg_name não encontrado diretamente. Tentando ajuste de nomenclatura..."
+            return 1
+        fi
+    elif [ "$PKG_MANAGER" = "pacman" ]; then
+        if pacman -Si "$pkg_name" >/dev/null 2>&1; then
+            echo "[INSTALAÇÃO] Instalando $pkg_name..."
+            $INSTALL_CMD "$pkg_name"
+        else
+            echo "[AVISO] Pacote $pkg_name não encontrado no Arch. Verifique o repositório." >&2
+            return 1
+        fi
+    fi
+}
+
+# 3. Função para Trocar para LXQt
+trocar_para_lxqt() {
+    echo "=================================================="
+    echo "Iniciando migração para o ambiente LXQt..."
+    echo "=================================================="
+    
+    $UPDATE_CMD
+    
+    # Instalação dos pacotes essenciais do LXQt e Display Manager correto (LightDM)
+    install_package_safe "lxqt" || install_package_safe "lxqt-core"
+    install_package_safe "lightdm"
+    install_package_safe "lightdm-gtk-greeter"
+    
+    # Configurar LightDM como gerenciador de login padrão
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable lightdm
+        systemctl set-default graphical.target
+    fi
+    
+    # Configurar sessão padrão para LXQt
+    echo "[CONFIGURAÇÃO] Definindo LXQt como sessão padrão..."
+    echo "exec startlxqt" > /etc/X11/xinit/xinitrc
+    
+    echo "[SUCESSO] Ambiente LXQt instalado e configurado com sucesso!"
+    echo "Verificação de sucesso: Digite 'systemctl get-default' (deve retornar graphical.target) e reinicie."
+}
+
+# 4. Função para Voltar para XFCE
+voltar_para_xfce() {
+    echo "=================================================="
+    echo "Iniciando retorno para o ambiente XFCE..."
+    echo "=================================================="
+    
+    $UPDATE_CMD
+    
+    # Instalação dos pacotes essenciais do XFCE e Display Manager
+    install_package_safe "xfce4"
+    install_package_safe "xfce4-goodies"
+    install_package_safe "lightdm"
+    install_package_safe "lightdm-gtk-greeter"
+    
+    # Configurar LightDM como gerenciador de login padrão
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable lightdm
+        systemctl set-default graphical.target
+    fi
+    
+    # Configurar sessão padrão para XFCE
+    echo "[CONFIGURAÇÃO] Definindo XFCE como sessão padrão..."
+    echo "exec startxfce4" > /etc/X11/xinit/xinitrc
+    
+    echo "[SUCESSO] Ambiente XFCE restaurado com sucesso!"
+    echo "Verificação de sucesso: Digite 'systemctl get-default' (deve retornar graphical.target) e reinicie."
+}
+
+# Inicialização da Detecção
+detect_environment
+
+# 5. Menu Principal Iterativo (Compatível com Bash e Ksh)
+while true; do
+    echo ""
+    echo "=================================================="
+    echo "       GERENCIADOR DE AMBIENTE GRÁFICO"
+    echo "=================================================="
+    echo "1. Trocar para LXQt"
+    echo "2. Voltar para XFCe"
+    echo "3. Sair"
+    echo "=================================================="
+    printf "Escolha uma opção [1-3]: "
+    read opcao
+
+    case "$opcao" in
+        1)
+            trocar_para_lxqt
+            ;;
+        2)
+            voltar_para_xfce
+            ;;
+        3)
+            echo "Saindo do programa. Até logo!"
+            exit 0
+            ;;
+        *)
+            echo "[ERRO] Opção inválida! Escolha entre 1 e 3."
+            ;;
+    esac
+done
