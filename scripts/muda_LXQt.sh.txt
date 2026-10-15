@@ -1,0 +1,929 @@
+#!/usr/bin/env bash
+#
+# LXQt SAFE MANAGER
+# Diagnóstico, compatibilidade, instalação, validação e recuperação.
+#
+# Distribuições suportadas:
+#   Debian / Ubuntu / Linux Mint / Pop!_OS / elementary OS / KDE neon
+#   Fedora / RHEL / CentOS Stream / Rocky Linux / AlmaLinux
+#   Arch Linux / Manjaro / EndeavourOS
+#   openSUSE
+#
+# GARANTIAS DE ESCOPO:
+#   - Não troca nem desativa o gerenciador de login atual.
+#   - Não instala nem substitui drivers gráficos.
+#   - Não executa atualização geral do sistema.
+#   - Não executa autoremove.
+#   - Não reinicia o computador.
+#   - Não executa rollback fictício de pacotes.
+#   - Não altera configurações na opção de diagnóstico.
+#   - Não prossegue se não conseguir validar os requisitos essenciais.
+#
+# OBSERVAÇÃO:
+#   A resolução de dependências e a confirmação final são realizadas
+#   pelo gerenciador nativo da distribuição.
+#
+# Requer Bash 4+, privilégios de administrador para instalação,
+# e acesso aos repositórios configurados.
+#
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+readonly SCRIPT_VERSION="2.0"
+readonly BACKUP_ROOT="/var/backups/lxqt-safe-manager"
+readonly MIN_FREE_KB=2097152
+
+DISTRO_ID=""
+DISTRO_LIKE=""
+DISTRO_VERSION=""
+DISTRO_NAME=""
+PKG=""
+INIT_SYSTEM=""
+CURRENT_DM=""
+CURRENT_DM_TARGET=""
+CURRENT_DM_UNIT=""
+GPU_COUNT=0
+GPU_UNBOUND=0
+BACKUP_DIR=""
+LAST_REPORT=""
+INSTALL_STARTED=0
+
+log()  { printf '[INFO] %s\n' "$*"; }
+warn() { printf '[AVISO] %s\n' "$*" >&2; }
+err()  { printf '[ERRO] %s\n' "$*" >&2; }
+
+pause_screen() {
+    printf '\nPressione ENTER para voltar ao menu...'
+    read -r _
+}
+
+die() {
+    err "$*"
+    return 1
+}
+
+confirm() {
+    local answer
+    read -r -p "$1 [s/N]: " answer
+    [[ "$answer" =~ ^[sS]$ ]]
+}
+
+require_root() {
+    if (( EUID != 0 )); then
+        if ! command -v sudo >/dev/null 2>&1; then
+            printf '[ERRO] Este script precisa de sudo ou root.\n' >&2
+            exit 1
+        fi
+
+        exec sudo --preserve-env=TERM bash "$0" "$@"
+    fi
+}
+
+on_error() {
+    local rc=$?
+    printf '\n'
+    err "Operação interrompida. Código de saída: $rc."
+
+    if (( INSTALL_STARTED )); then
+        warn "Uma transação de instalação foi iniciada."
+        warn "O gerenciador de pacotes pode ter aplicado alterações parciais."
+        warn "Este script não consegue garantir rollback integral."
+    fi
+
+    if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
+        log "Registros disponíveis em: $BACKUP_DIR"
+    fi
+
+    return "$rc"
+}
+
+trap on_error ERR
+
+detect_os() {
+    [[ -r /etc/os-release ]] || {
+        err "Arquivo /etc/os-release não encontrado."
+        return 1
+    }
+
+    # shellcheck disable=SC1091
+    source /etc/os-release
+
+    DISTRO_ID="${ID,,}"
+    DISTRO_LIKE="${ID_LIKE:-}"
+    DISTRO_VERSION="${VERSION_ID:-desconhecida}"
+    DISTRO_NAME="${PRETTY_NAME:-$DISTRO_ID}"
+
+    if command -v apt-get >/dev/null 2>&1 &&
+       command -v apt-cache >/dev/null 2>&1; then
+        PKG="apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG="dnf"
+    elif command -v pacman >/dev/null 2>&1; then
+        PKG="pacman"
+    elif command -v zypper >/dev/null 2>&1; then
+        PKG="zypper"
+    else
+        PKG="desconhecido"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 &&
+       [[ -d /run/systemd/system ]]; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1; then
+        INIT_SYSTEM="openrc"
+    else
+        INIT_SYSTEM="outro"
+    fi
+
+    log "Distribuição: $DISTRO_NAME"
+    log "ID: $DISTRO_ID"
+    log "Versão: $DISTRO_VERSION"
+    log "Família de pacotes: $PKG"
+    log "Inicialização: $INIT_SYSTEM"
+
+    case "$PKG" in
+        apt)
+            case "$DISTRO_ID $DISTRO_LIKE" in
+                *debian*|*ubuntu*|*linuxmint*|*pop*|*elementary*|*neon*)
+                    ;;
+                *)
+                    warn "Distribuição APT não reconhecida como validada."
+                    ;;
+            esac
+            ;;
+        dnf)
+            case "$DISTRO_ID $DISTRO_LIKE" in
+                *fedora*|*rhel*|*centos*|*rocky*|*alma*)
+                    ;;
+                *)
+                    warn "Distribuição DNF não reconhecida como validada."
+                    ;;
+            esac
+            ;;
+        pacman)
+            case "$DISTRO_ID $DISTRO_LIKE" in
+                *arch*|*manjaro*|*endeavour*)
+                    ;;
+                *)
+                    warn "Distribuição Pacman não reconhecida como validada."
+                    ;;
+            esac
+            ;;
+        zypper)
+            case "$DISTRO_ID $DISTRO_LIKE" in
+                *opensuse*|*suse*)
+                    ;;
+                *)
+                    warn "Distribuição Zypper não reconhecida como validada."
+                    ;;
+            esac
+            ;;
+        *)
+            err "Não foi possível identificar um gerenciador de pacotes suportado."
+            return 1
+            ;;
+    esac
+}
+
+check_disk_space() {
+    local free_kb
+    free_kb="$(df -Pk / | awk 'NR == 2 {print $4}')"
+
+    [[ "$free_kb" =~ ^[0-9]+$ ]] || {
+        err "Não foi possível calcular o espaço livre."
+        return 1
+    }
+
+    printf 'Espaço livre na raiz: %s MiB\n' "$((free_kb / 1024))"
+
+    if (( free_kb < MIN_FREE_KB )); then
+        err "Menos de 2 GiB livres na raiz."
+        return 1
+    fi
+}
+
+check_package_manager_health() {
+    case "$PKG" in
+        apt)
+            local audit
+            audit="$(dpkg --audit 2>&1 || true)"
+
+            if [[ -n "$audit" ]]; then
+                printf '%s\n' "$audit"
+                err "O dpkg apresenta pendências. Corrija-as antes de instalar."
+                return 1
+            fi
+            ;;
+        pacman)
+            if [[ -e /var/lib/pacman/db.lck ]]; then
+                err "Arquivo de bloqueio do Pacman encontrado."
+                err "Confirme que não existe uma operação de pacotes em andamento."
+                return 1
+            fi
+            ;;
+    esac
+}
+
+check_environment() {
+    check_disk_space || return 1
+    check_package_manager_health || return 1
+
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        warn "A sessão é remota por SSH."
+        warn "O script não troca o gerenciador de login, mas a instalação remota não é recomendada."
+        confirm "Deseja continuar mesmo assim?" || return 1
+    fi
+
+    if [[ "$INIT_SYSTEM" != "systemd" ]]; then
+        warn "O sistema não usa systemd."
+        warn "A instalação do LXQt pode funcionar, mas os procedimentos de login variam."
+    fi
+}
+
+detect_gpu() {
+    local dev class vendor driver
+    GPU_COUNT=0
+    GPU_UNBOUND=0
+
+    shopt -s nullglob
+
+    for dev in /sys/bus/pci/devices/*; do
+        [[ -r "$dev/class" ]] || continue
+        class="$(<"$dev/class")"
+
+        case "$class" in
+            0x030000|0x030200|0x038000) ;;
+            *) continue ;;
+        esac
+
+        ((GPU_COUNT += 1))
+        vendor="desconhecido"
+
+        [[ -r "$dev/vendor" ]] && vendor="$(<"$dev/vendor")"
+
+        case "$vendor" in
+            0x8086) vendor="Intel" ;;
+            0x1002) vendor="AMD/ATI" ;;
+            0x10de) vendor="NVIDIA" ;;
+        esac
+
+        if [[ -L "$dev/driver" ]]; then
+            driver="$(basename "$(readlink -f "$dev/driver")")"
+            printf 'GPU %s: %s | Driver associado: %s\n' \
+                "$GPU_COUNT" "$vendor" "$driver"
+        else
+            ((GPU_UNBOUND += 1))
+            warn "GPU $GPU_COUNT: $vendor | Nenhum driver associado."
+        fi
+    done
+
+    shopt -u nullglob
+
+    if (( GPU_COUNT == 0 )); then
+        warn "Nenhuma GPU PCI detectada."
+        warn "Isso não prova que o sistema não possui GPU."
+    fi
+
+    if (( GPU_UNBOUND > 0 )); then
+        warn "Há GPU sem driver associado."
+        warn "O script não instalará nem substituirá drivers automaticamente."
+    fi
+
+    if command -v lspci >/dev/null 2>&1; then
+        printf '\nResumo de controladores gráficos via lspci:\n'
+        lspci -nnk 2>/dev/null |
+            grep -i -A3 -E 'VGA compatible controller|3D controller|Display controller' ||
+            true
+    else
+        warn "lspci não está instalado; diagnóstico PCI limitado."
+    fi
+}
+
+detect_display_manager() {
+    local link="/etc/systemd/system/display-manager.service"
+    local resolved=""
+    local unit=""
+
+    CURRENT_DM="não identificado"
+    CURRENT_DM_TARGET=""
+    CURRENT_DM_UNIT=""
+
+    if [[ -L "$link" ]]; then
+        CURRENT_DM_TARGET="$(readlink "$link")"
+        resolved="$(readlink -f "$link" 2>/dev/null || true)"
+        unit="$(basename "${resolved:-}")"
+
+        case "$unit" in
+            *gdm3*) CURRENT_DM="GDM3" ;;
+            *gdm*) CURRENT_DM="GDM" ;;
+            *lightdm*) CURRENT_DM="LightDM" ;;
+            *sddm*) CURRENT_DM="SDDM" ;;
+            *lxdm*) CURRENT_DM="LXDM" ;;
+            *xdm*) CURRENT_DM="XDM" ;;
+            *) CURRENT_DM="desconhecido ($unit)" ;;
+        esac
+
+        [[ "$unit" == *.service ]] && CURRENT_DM_UNIT="$unit"
+    fi
+
+    if [[ "$CURRENT_DM" == "não identificado" ]] &&
+       command -v systemctl >/dev/null 2>&1; then
+        local candidate
+
+        for candidate in gdm3.service gdm.service lightdm.service \
+                         sddm.service lxdm.service xdm.service; do
+            if systemctl is-active --quiet "$candidate"; then
+                CURRENT_DM="$candidate"
+                CURRENT_DM_UNIT="$candidate"
+                break
+            fi
+        done
+    fi
+
+    log "Gerenciador de login: $CURRENT_DM"
+
+    if [[ -n "$CURRENT_DM_UNIT" ]]; then
+        log "Unidade detectada: $CURRENT_DM_UNIT"
+        log "Estado: $(systemctl is-active "$CURRENT_DM_UNIT" 2>/dev/null || true)"
+    fi
+
+    if [[ -n "$CURRENT_DM_TARGET" ]]; then
+        log "Alvo do alias: $CURRENT_DM_TARGET"
+    fi
+
+    log "O gerenciador de login não será alterado pelo instalador."
+}
+
+show_session_info() {
+    printf '\n--- Sessão atual ---\n'
+    printf 'XDG_CURRENT_DESKTOP: %s\n' "${XDG_CURRENT_DESKTOP:-não definido}"
+    printf 'XDG_SESSION_TYPE: %s\n' "${XDG_SESSION_TYPE:-não definido}"
+    printf 'DESKTOP_SESSION: %s\n' "${DESKTOP_SESSION:-não definido}"
+    printf 'DISPLAY: %s\n' "${DISPLAY:-não definido}"
+    printf 'WAYLAND_DISPLAY: %s\n' "${WAYLAND_DISPLAY:-não definido}"
+    printf 'XDG_SESSION_ID: %s\n' "${XDG_SESSION_ID:-não definido}"
+}
+
+report_environment() {
+    printf '\n========================================\n'
+    printf ' DIAGNÓSTICO DO SISTEMA\n'
+    printf '========================================\n\n'
+
+    detect_os || return 1
+    check_environment || warn "Há verificações de ambiente pendentes."
+    detect_gpu
+    detect_display_manager
+    show_session_info
+
+    printf '\n--- Kernel e arquitetura ---\n'
+    uname -a
+    printf 'Arquitetura: '
+    uname -m
+
+    printf '\n--- Memória ---\n'
+    free -h 2>/dev/null || true
+
+    printf '\n--- Disco ---\n'
+    df -h / 2>/dev/null || true
+
+    printf '\n--- Ferramentas disponíveis ---\n'
+    for cmd in lspci inxi glxinfo glxgears startlxqt Xorg Xwayland; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            printf '%-12s %s\n' "$cmd" "$(command -v "$cmd")"
+        else
+            printf '%-12s não encontrado\n' "$cmd"
+        fi
+    done
+
+    printf '\n--- Pacotes LXQt instalados ---\n'
+    case "$PKG" in
+        apt)
+            dpkg-query -W -f='${binary:Package}\t${Version}\n' '*lxqt*' \
+                2>/dev/null || true
+            ;;
+        dnf)
+            rpm -qa '*lxqt*' 2>/dev/null || true
+            ;;
+        pacman)
+            pacman -Q 2>/dev/null | grep -i lxqt || true
+            ;;
+        zypper)
+            rpm -qa '*lxqt*' 2>/dev/null || true
+            ;;
+    esac
+}
+
+package_available() {
+    local package="$1"
+
+    case "$PKG" in
+        apt)
+            apt-cache show "$package" >/dev/null 2>&1
+            ;;
+        dnf)
+            dnf -q repoquery --available "$package" >/dev/null 2>&1
+            ;;
+        pacman)
+            pacman -Si "$package" >/dev/null 2>&1
+            ;;
+        zypper)
+            zypper --non-interactive info "$package" >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+validate_package_list() {
+    local package
+    local failed=0
+    local required=()
+
+    case "$PKG" in
+        apt)
+            required=(lxqt)
+            ;;
+        dnf)
+            required=(lxqt-session lxqt-panel pcmanfm-qt)
+            ;;
+        pacman)
+            required=(lxqt-session lxqt-panel pcmanfm-qt)
+            ;;
+        zypper)
+            required=(lxqt-session lxqt-panel pcmanfm-qt)
+            ;;
+    esac
+
+    printf '\n--- Validação dos pacotes essenciais ---\n'
+
+    for package in "${required[@]}"; do
+        if package_available "$package"; then
+            log "Disponível: $package"
+        else
+            err "Indisponível: $package"
+            ((failed += 1))
+        fi
+    done
+
+    if (( failed > 0 )); then
+        err "Não foi possível validar todos os pacotes essenciais."
+        err "Nenhuma instalação será iniciada."
+        return 1
+    fi
+
+    log "Pacotes essenciais validados."
+}
+
+check_apt_simulation() {
+    local output
+    local rc
+    local packages=(lxqt)
+
+    set +e
+    output="$(apt-get -s install "${packages[@]}" 2>&1)"
+    rc=$?
+    set -e
+
+    printf '%s\n' "$output"
+
+    if (( rc != 0 )); then
+        err "A simulação APT falhou."
+        return 1
+    fi
+
+    if printf '%s\n' "$output" |
+        grep -Eq '^(Remv|Purg) '; then
+        err "A simulação APT prevê remoções."
+        return 1
+    fi
+
+    if printf '%s\n' "$output" |
+        grep -Eiq 'held broken packages|unmet dependencies|not installable'; then
+        err "A simulação APT identificou dependências não resolvidas."
+        return 1
+    fi
+
+    log "Simulação APT sem remoções explícitas."
+}
+
+check_dnf_simulation() {
+    local output
+    local rc
+    local packages=(lxqt-session lxqt-panel pcmanfm-qt)
+
+    set +e
+    output="$(dnf --assumeno install "${packages[@]}" 2>&1)"
+    rc=$?
+    set -e
+
+    printf '%s\n' "$output"
+
+    # DNF pode retornar código diferente de zero porque --assumeno recusa
+    # a confirmação final. O texto da transação precisa ser inspecionado.
+    if printf '%s\n' "$output" |
+        grep -Eiq 'No match for argument|Unable to find a match|Error:'; then
+        err "O DNF não conseguiu resolver a transação."
+        return 1
+    fi
+
+    if printf '%s\n' "$output" |
+        grep -Eiq 'Removing|Erase[[:space:]]+[0-9]+[[:space:]]+Packages'; then
+        err "A simulação DNF pode remover pacotes."
+        return 1
+    fi
+
+    log "Simulação DNF apresentada; revise a transação antes de confirmar."
+    return 0
+}
+
+check_pacman_simulation() {
+    local output
+    local rc
+    local packages=(lxqt-session lxqt-panel pcmanfm-qt)
+
+    set +e
+    output="$(pacman -Sp --needed "${packages[@]}" 2>&1)"
+    rc=$?
+    set -e
+
+    printf '%s\n' "$output"
+
+    if (( rc != 0 )); then
+        err "O Pacman não conseguiu resolver os pacotes."
+        return 1
+    fi
+
+    warn "A lista Pacman não simula todos os conflitos da transação."
+    warn "Na instalação real, revise as remoções antes de confirmar."
+}
+
+check_zypper_simulation() {
+    local output
+    local rc
+    local packages=(lxqt-session lxqt-panel pcmanfm-qt)
+
+    set +e
+    output="$(zypper --non-interactive --dry-run install "${packages[@]}" 2>&1)"
+    rc=$?
+    set -e
+
+    printf '%s\n' "$output"
+
+    if (( rc != 0 )); then
+        err "A simulação Zypper falhou."
+        return 1
+    fi
+
+    if printf '%s\n' "$output" |
+        grep -Eiq 'will be REMOVED|following.*packages.*removed'; then
+        err "A simulação Zypper prevê remoções."
+        return 1
+    fi
+
+    log "Simulação Zypper concluída."
+}
+
+simulate_installation() {
+    validate_package_list || return 1
+
+    printf '\n--- Simulação da instalação ---\n'
+
+    case "$PKG" in
+        apt) check_apt_simulation ;;
+        dnf) check_dnf_simulation ;;
+        pacman) check_pacman_simulation ;;
+        zypper) check_zypper_simulation ;;
+        *) return 1 ;;
+    esac
+}
+
+create_backup() {
+    local stamp
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    BACKUP_DIR="$BACKUP_ROOT/$stamp"
+
+    install -d -m 700 "$BACKUP_DIR"
+
+    {
+        printf 'data=%s\n' "$(date --iso-8601=seconds)"
+        printf 'script_version=%s\n' "$SCRIPT_VERSION"
+        printf 'distribuicao=%s\n' "$DISTRO_NAME"
+        printf 'id=%s\n' "$DISTRO_ID"
+        printf 'versao=%s\n' "$DISTRO_VERSION"
+        printf 'gerenciador_pacotes=%s\n' "$PKG"
+        printf 'gerenciador_login=%s\n' "$CURRENT_DM"
+        printf 'gpu_count=%s\n' "$GPU_COUNT"
+        printf 'gpu_sem_driver=%s\n' "$GPU_UNBOUND"
+    } > "$BACKUP_DIR/estado.txt"
+
+    cp -a /etc/os-release "$BACKUP_DIR/os-release"
+
+    if [[ -r /etc/X11/default-display-manager ]]; then
+        cp -a /etc/X11/default-display-manager \
+            "$BACKUP_DIR/default-display-manager"
+    fi
+
+    if [[ -L /etc/systemd/system/display-manager.service ]]; then
+        cp -a /etc/systemd/system/display-manager.service \
+            "$BACKUP_DIR/display-manager.service"
+    fi
+
+    case "$PKG" in
+        apt)
+            dpkg-query -W \
+                -f='${binary:Package}\t${Version}\n' \
+                > "$BACKUP_DIR/pacotes-antes.txt" 2>&1 || true
+            ;;
+        dnf|zypper)
+            rpm -qa > "$BACKUP_DIR/pacotes-antes.txt" 2>&1 || true
+            ;;
+        pacman)
+            pacman -Q > "$BACKUP_DIR/pacotes-antes.txt" 2>&1 || true
+            ;;
+    esac
+
+    log "Backup de configuração e inventário: $BACKUP_DIR"
+}
+
+install_lxqt() {
+    printf '\n'
+    warn "O gerenciador de login atual será preservado."
+    warn "Não serão instalados drivers gráficos."
+    warn "Não será executada atualização geral do sistema."
+    warn "Leia a transação que o gerenciador nativo apresentar."
+
+    confirm "Deseja prosseguir com a instalação do LXQt?" || {
+        log "Instalação cancelada."
+        return 0
+    }
+
+    create_backup
+    INSTALL_STARTED=1
+
+    case "$PKG" in
+        apt)
+            apt-get install lxqt
+            ;;
+        dnf)
+            dnf install lxqt-session lxqt-panel pcmanfm-qt
+            ;;
+        pacman)
+            pacman -S --needed lxqt-session lxqt-panel pcmanfm-qt
+            ;;
+        zypper)
+            zypper install lxqt-session lxqt-panel pcmanfm-qt
+            ;;
+        *)
+            err "Gerenciador de pacotes não suportado."
+            return 1
+            ;;
+    esac
+
+    log "O comando de instalação terminou."
+    warn "Isso não comprova que todos os componentes opcionais estão instalados."
+}
+
+validate_installation() {
+    local f found=0
+    local packages=()
+
+    printf '\n--- Validação pós-instalação ---\n'
+
+    case "$PKG" in
+        apt)
+            packages=(lxqt)
+            ;;
+        dnf|pacman|zypper)
+            packages=(lxqt-session lxqt-panel pcmanfm-qt)
+            ;;
+    esac
+
+    local package
+    for package in "${packages[@]}"; do
+        case "$PKG" in
+            apt)
+                dpkg-query -W -f='${Status}' "$package" 2>/dev/null |
+                    grep -q 'install ok installed' ||
+                    { err "Pacote não instalado: $package"; return 1; }
+                ;;
+            dnf|zypper)
+                rpm -q "$package" >/dev/null 2>&1 ||
+                    { err "Pacote não instalado: $package"; return 1; }
+                ;;
+            pacman)
+                pacman -Q "$package" >/dev/null 2>&1 ||
+                    { err "Pacote não instalado: $package"; return 1; }
+                ;;
+        esac
+
+        log "Pacote instalado: $package"
+    done
+
+    for f in \
+        /usr/share/xsessions/lxqt.desktop \
+        /usr/local/share/xsessions/lxqt.desktop \
+        /usr/share/wayland-sessions/lxqt.desktop \
+        /usr/local/share/wayland-sessions/lxqt.desktop
+    do
+        if [[ -r "$f" ]]; then
+            log "Arquivo de sessão: $f"
+            found=1
+        fi
+    done
+
+    if (( found == 0 )); then
+        err "Arquivo de sessão LXQt não encontrado nos caminhos padrão."
+        warn "A instalação pode estar incompleta ou usar um caminho diferente."
+        return 1
+    fi
+
+    if command -v startlxqt >/dev/null 2>&1; then
+        log "Comando startlxqt encontrado."
+    else
+        warn "Comando startlxqt não encontrado no PATH."
+        warn "Confirme o conteúdo do arquivo de sessão antes de iniciar o LXQt."
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        log "O gerenciador de login não foi alterado."
+        log "Não foi realizado teste destrutivo da sessão gráfica."
+    fi
+
+    log "Validação básica concluída. Ainda é necessário testar uma sessão LXQt."
+}
+
+create_report() {
+    local stamp
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    LAST_REPORT="/var/tmp/lxqt-report-$stamp.txt"
+
+    {
+        printf 'RELATÓRIO LXQt SAFE MANAGER\n'
+        printf 'Data: %s\n\n' "$(date --iso-8601=seconds)"
+        printf '%s\n' '--- Sistema ---'
+        cat /etc/os-release
+        printf '\n%s\n' '--- Kernel ---'
+        uname -a
+        printf '\n%s\n' '--- Memória ---'
+        free -h 2>/dev/null || true
+        printf '\n%s\n' '--- Disco ---'
+        df -h
+        printf '\n%s\n' '--- Sessão ---'
+        printf 'XDG_CURRENT_DESKTOP=%s\n' "${XDG_CURRENT_DESKTOP:-não definido}"
+        printf 'XDG_SESSION_TYPE=%s\n' "${XDG_SESSION_TYPE:-não definido}"
+        printf 'DESKTOP_SESSION=%s\n' "${DESKTOP_SESSION:-não definido}"
+        printf '\n%s\n' '--- GPU ---'
+
+        if command -v lspci >/dev/null 2>&1; then
+            lspci -nnk 2>/dev/null |
+                grep -i -A3 -E 'VGA compatible controller|3D controller|Display controller' ||
+                true
+        else
+            printf '%s\n' 'lspci não instalado.'
+        fi
+
+        printf '\n%s\n' '--- Gerenciador de login ---'
+        printf 'Identificado: %s\n' "$CURRENT_DM"
+        printf 'Unidade: %s\n' "$CURRENT_DM_UNIT"
+        printf 'Alias: %s\n' "$CURRENT_DM_TARGET"
+
+        printf '\n%s\n' '--- Sessões LXQt ---'
+        find /usr/share/xsessions /usr/share/wayland-sessions \
+            -maxdepth 1 -type f -iname '*lxqt*.desktop' -print 2>/dev/null || true
+
+        printf '\n%s\n' '--- Pacotes LXQt instalados ---'
+        case "$PKG" in
+            apt)
+                dpkg-query -W -f='${binary:Package}\t${Version}\n' '*lxqt*' \
+                    2>/dev/null || true
+                ;;
+            dnf|zypper)
+                rpm -qa '*lxqt*' 2>/dev/null || true
+                ;;
+            pacman)
+                pacman -Q 2>/dev/null | grep -i lxqt || true
+                ;;
+        esac
+    } > "$LAST_REPORT"
+
+    chmod 600 "$LAST_REPORT"
+    log "Relatório salvo em: $LAST_REPORT"
+}
+
+show_recovery_instructions() {
+    printf '\n========================================\n'
+    printf ' RECUPERAÇÃO DO AMBIENTE GRÁFICO\n'
+    printf '========================================\n\n'
+
+    printf '%s\n' \
+        'Este script não substitui o gerenciador de login.' \
+        'Portanto, não há uma troca de gerenciador para reverter.' \
+        '' \
+        'Se a instalação do LXQt falhar:' \
+        '1. Não execute autoremove.' \
+        '2. Não remova o ambiente gráfico atual.' \
+        '3. Leia a mensagem de erro e o relatório.' \
+        '4. Use o gerenciador nativo para corrigir dependências pendentes.' \
+        '' \
+        'Debian/Ubuntu:' \
+        '  sudo dpkg --configure -a' \
+        '  sudo apt-get -f install' \
+        '' \
+        'Fedora:' \
+        '  sudo dnf check' \
+        '' \
+        'Arch Linux:' \
+        '  sudo pacman -Dk' \
+        '' \
+        'openSUSE:' \
+        '  sudo zypper verify' \
+        '' \
+        'IMPORTANTE: os comandos de correção acima podem modificar o sistema.' \
+        'Execute-os somente após ler a mensagem de erro e entender a proposta.' \
+        'Não são comandos de rollback e não garantem restauração integral.'
+
+    if [[ -n "$BACKUP_DIR" ]]; then
+        printf '\nDiretório de backup: %s\n' "$BACKUP_DIR"
+    fi
+
+    if [[ -n "$LAST_REPORT" ]]; then
+        printf 'Relatório: %s\n' "$LAST_REPORT"
+    fi
+}
+
+show_menu() {
+    while true; do
+        printf '\n'
+        printf '================================================\n'
+        printf '           LXQt SAFE MANAGER %s\n' "$SCRIPT_VERSION"
+        printf '================================================\n'
+        printf 'Sistema: %s\n' "${DISTRO_NAME:-não detectado}"
+        printf 'Pacotes: %s\n' "${PKG:-não detectado}"
+        printf 'Login atual: %s\n' "${CURRENT_DM:-não detectado}"
+        printf '\n'
+        printf '  1) Diagnosticar sistema e hardware\n'
+        printf '  2) Verificar compatibilidade do LXQt\n'
+        printf '  3) Simular instalação\n'
+        printf '  4) Instalar LXQt\n'
+        printf '  5) Validar instalação existente\n'
+        printf '  6) Mostrar instruções de recuperação\n'
+        printf '  7) Gerar relatório técnico\n'
+        printf '  8) Sair sem outras alterações\n'
+        printf '\n'
+
+        local choice
+        read -r -p 'Selecione uma opção: ' choice
+
+        case "$choice" in
+            1)
+                report_environment
+                pause_screen
+                ;;
+            2)
+                detect_gpu
+                detect_display_manager
+                validate_package_list
+                pause_screen
+                ;;
+            3)
+                simulate_installation
+                pause_screen
+                ;;
+            4)
+                simulate_installation &&
+                    install_lxqt
+                pause_screen
+                ;;
+            5)
+                validate_installation
+                pause_screen
+                ;;
+            6)
+                show_recovery_instructions
+                pause_screen
+                ;;
+            7)
+                create_report
+                pause_screen
+                ;;
+            8)
+                log "Encerrado."
+                return 0
+                ;;
+            *)
+                warn "Opção inválida."
+                ;;
+        esac
+    done
+}
+
+main() {
+    require_root "$@"
+    detect_os || exit 1
+    show_menu
+}
+
+main "$@"
